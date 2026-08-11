@@ -5,18 +5,20 @@ echo 零售通知自动分发工具 - 打包脚本
 echo ========================================
 echo.
 
-python --version >nul 2>&1
+set VENV_PATH=venv\Scripts
+
+%VENV_PATH%\python --version >nul 2>&1
 if errorlevel 1 (
     echo 错误: 未找到Python，请先安装Python
     pause & exit /b 1
 )
 
-echo 正在安装依赖...
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-if errorlevel 1 (
-    echo 错误: 安装依赖失败
-    pause & exit /b 1
-)
+REM echo 正在安装依赖...
+REM %VENV_PATH%\pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+REM if errorlevel 1 (
+REM     echo 错误: 安装依赖失败
+REM     pause & exit /b 1
+REM )
 
 echo.
 echo 清理旧的构建文件...
@@ -25,7 +27,7 @@ if exist "dist\零售通知工具" rmdir /s /q "dist\零售通知工具"
 
 echo.
 echo 正在打包...
-pyinstaller "零售通知工具.spec"
+%VENV_PATH%\pyinstaller "零售通知工具.spec"
 if errorlevel 1 (
     echo 错误: 打包失败
     pause & exit /b 1
