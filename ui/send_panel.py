@@ -172,7 +172,7 @@ class SendPanel(QWidget):
         # 发送按钮区域
         btn_layout = QHBoxLayout()
 
-        self.send_btn = QPushButton("🚀 开始发送")
+        self.send_btn = QPushButton("🚀 提交审批")
         self.send_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -314,7 +314,7 @@ class SendPanel(QWidget):
         return groups
 
     def start_send(self):
-        """开始发送"""
+        """提交审批任务（不再直接发送，交由审批人审批后执行）"""
         # 获取消息内容
         content = self.get_message_content()
         if not content:
@@ -340,38 +340,44 @@ class SendPanel(QWidget):
             QMessageBox.warning(self, "提示", "请至少选择一个目标群组")
             return
 
-        # 确认发送
+        # 确认提交
         reply = QMessageBox.question(
-            self, "确认发送",
-            f"确定要向 {len(groups)} 个群组发送消息吗？\n\n"
-            f"预计耗时: {len(groups) * self.interval_spin.value()} 秒",
+            self, "确认提交",
+            f"确定要向 {len(groups)} 个群组提交审批任务吗？\n\n"
+            f"审批通过后才会真实发送。",
             QMessageBox.Yes | QMessageBox.No
         )
 
         if reply != QMessageBox.Yes:
             return
 
-        # 更新发送器参数
-        self.sender.interval = self.interval_spin.value()
-        self.sender.retries = self.retries_spin.value()
+        # 组装审批任务（复用现有发送内核，由审批人审批后执行）
+        from core.approval import PendingTaskStore, AuditLog
+        from core.auth import ROLE_OPERATOR, ROLE_LABELS
 
-        # 清空日志
-        self.send_log.clear()
-        self.log_text.clear()
+        task = {
+            "type": "group",
+            "content": content,
+            "targets": groups,
+            "send_params": {
+                "interval": self.interval_spin.value(),
+                "retries": self.retries_spin.value(),
+            },
+            "submitter": ROLE_LABELS.get(ROLE_OPERATOR, "经办人"),
+        }
+        store = PendingTaskStore()
+        task = store.add(task)
+        AuditLog().log(
+            "submit", task_id=task["id"], operator=task["submitter"],
+            target_summary=f"{len(groups)} 群",
+        )
 
-        # 更新UI状态
-        self.is_sending = True
-        self.send_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.progress_bar.setMaximum(len(groups))
-        self.progress_bar.setValue(0)
+        QMessageBox.information(
+            self, "已提交审批",
+            f"任务已提交审批（编号 #{task['id']}）。\n"
+            "审批人通过后才会真实发送。"
+        )
 
-        # 启动发送线程
-        self.send_thread = SendThread(self.sender, groups, content)
-        self.send_thread.progress.connect(self.on_progress)
-        self.send_thread.result.connect(self.on_result)
-        self.send_thread.finished.connect(self.on_finished)
-        self.send_thread.start()
 
     def stop_send(self):
         """停止发送"""

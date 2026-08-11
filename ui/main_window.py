@@ -108,6 +108,12 @@ class MainWindow(QMainWindow):
         test_action.triggered.connect(self.test_selected_webhook)
         tools_menu.addAction(test_action)
 
+        tools_menu.addSeparator()
+
+        change_token_action = QAction("修改 Token", self)
+        change_token_action.triggered.connect(self.change_token)
+        tools_menu.addAction(change_token_action)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -146,6 +152,14 @@ class MainWindow(QMainWindow):
             self, "测试结果",
             "Webhook测试结果:\n\n" + "\n".join(results)
         )
+
+    def change_token(self):
+        """主动修改当前经办人的 Token"""
+        from core.auth import get_auth, ROLE_OPERATOR
+        from ui.login import ChangeTokenDialog
+        auth = get_auth()
+        dialog = ChangeTokenDialog(auth, ROLE_OPERATOR, forced=False, parent=self)
+        dialog.exec_()
 
     def show_about(self):
         """显示关于对话框"""

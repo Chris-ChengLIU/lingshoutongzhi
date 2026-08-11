@@ -388,7 +388,7 @@ class PersonalPanel(QWidget):
 
         # 进度条 + 控制按钮
         ctrl_row = QHBoxLayout()
-        self.send_btn = QPushButton("🚀 开始发送")
+        self.send_btn = QPushButton("🚀 提交审批")
         self.send_btn.setMinimumHeight(34)
         self.send_btn.setStyleSheet(
             "QPushButton { background: #1976d2; color: white; border-radius: 4px; font-size: 13px; }"
@@ -824,7 +824,7 @@ class PersonalPanel(QWidget):
         ]
 
     def start_send(self):
-        """开始发送"""
+        """提交审批任务（不再直接发送，交由审批人审批后执行）"""
         content = self.msg_edit.toPlainText().strip()
         if not content:
             QMessageBox.warning(self, "提示", "请输入消息内容")
@@ -842,52 +842,47 @@ class PersonalPanel(QWidget):
             return
 
         # 确认对话框
-        # unit_sel = self.unit_filter.currentText()
-        # unit_desc = f"【{unit_sel}】" if unit_sel != "全部" else "【全部】"
         units_sel = self.unit_filter.checked_items()
         unit_desc = f"【{'、'.join(units_sel)}】" if units_sel else "【全部】"
         confirm_text = (
-            f"即将向以下范围发送消息：\n\n"
+            f"即将提交以下范围的通知：\n\n"
             f"  部门筛选：{unit_desc}\n"
-            f"  目标人数：{len(targets)} 位（已启用且可见）\n\n"   # ← 改这行
+            f"  目标人数：{len(targets)} 位（已启用且可见）\n\n"
             f"消息内容（前50字）：\n{content[:50]}{'…' if len(content) > 50 else ''}\n\n"
-            f"请确保企业微信 PC 端已打开，发送期间请勿操作鼠标。\n\n"
-            f"确认开始发送？"
+            f"确认提交审批？"
         )
-        reply = QMessageBox.question(self, "确认发送", confirm_text, QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(self, "确认提交", confirm_text, QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
 
-        # 构建 sender
-        self.sender = PersonalSender(
-            search_delay=self.search_delay_spin.value(),
-            send_interval=self.send_interval_spin.value(),
-            dry_run=False,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+        # 组装审批任务（复用现有发送内核，由审批人审批后执行）
+        from core.approval import PendingTaskStore, AuditLog
+        from core.auth import ROLE_OPERATOR, ROLE_LABELS
+
+        task = {
+            "type": "personal",
+            "content": content,
+            "targets": targets,
+            "file_paths": self.get_file_paths(),
+            "send_params": {
+                "search_delay": self.search_delay_spin.value(),
+                "send_interval": self.send_interval_spin.value(),
+            },
+            "submitter": ROLE_LABELS.get(ROLE_OPERATOR, "经办人"),
+        }
+        store = PendingTaskStore()
+        task = store.add(task)
+        AuditLog().log(
+            "submit", task_id=task["id"], operator=task["submitter"],
+            target_summary=f"{len(targets)} 人",
         )
 
-        # 构建工作线程
-        self.thread = QThread()
-        # self.worker = PersonalSendWorker(self.sender, targets, content)
-        self.worker = PersonalSendWorker(self.sender, targets, content, self.get_file_paths())
-        self.worker.moveToThread(self.thread)
+        QMessageBox.information(
+            self, "已提交审批",
+            f"任务已提交审批（编号 #{task['id']}）。\n"
+            "审批人通过后才会真实发送。"
+        )
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.result.connect(self._on_result)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.finished.connect(self.thread.quit)
-
-        # 更新 UI 状态
-        self.is_sending = True
-        self.send_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(targets))
-        self.progress_bar.setValue(0)
-        self.log_edit.clear()
-        self._log(f"开始发送，目标：{len(targets)} 位联系人", color="#1565c0")
-
-        self.thread.start()
 
     def stop_send(self):
         if self.sender:

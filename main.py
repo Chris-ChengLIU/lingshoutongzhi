@@ -28,13 +28,20 @@ logging.basicConfig(
 )
 
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QDialog
 from PyQt5.QtGui import QFont
 from ui.main_window import MainWindow
 
 
 def main():
     """主函数"""
+    # 处理 --reset-auth：重置为初始凭证（遗忘 Token 后恢复用）
+    if "--reset-auth" in sys.argv:
+        from core.auth import get_auth
+        get_auth().reset()
+        print("已重置为初始 Token（详见 core/auth.py 中的 INITIAL_*_TOKEN 常量）")
+        return
+
     app = QApplication(sys.argv)
 
     # 设置应用程序字体
@@ -44,8 +51,29 @@ def main():
     # 设置应用程序样式
     app.setStyle("Fusion")
 
-    # 创建并显示主窗口
-    window = MainWindow()
+    # ── 登录拦截 ──────────────────────────────────────────
+    from core.auth import get_auth, ROLE_APPROVER
+    from ui.login import LoginDialog, ChangeTokenDialog
+
+    auth = get_auth()
+
+    login = LoginDialog(auth)
+    if login.exec_() != QDialog.Accepted:
+        return  # 用户未登录，退出
+
+    # 首次登录强制改密（经办人 / 审批人）
+    if login.needs_change:
+        change = ChangeTokenDialog(auth, login.result_role)
+        if change.exec_() != QDialog.Accepted:
+            return
+
+    # ── 路由/视图隔离 ─────────────────────────────────────
+    if login.result_role == ROLE_APPROVER:
+        from ui.approval_workbench import ApprovalWorkbench
+        window = ApprovalWorkbench(auth=auth)
+    else:
+        window = MainWindow()
+
     window.show()
 
     sys.exit(app.exec_())
