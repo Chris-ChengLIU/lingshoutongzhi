@@ -1,0 +1,18 @@
+# PyQt5>=5.15.0
+# openpyxl>=3.1.0
+# pyinstaller>=5.0
+# pyautogui
+# pyperclip
+# pygetwindow
+openpyxl==3.1.5
+paddleocr==2.7.3
+pyautogui==0.9.54
+PyGetWindow==0.0.9
+pyperclip==1.11.0
+PyQt5==5.15.11
+pyqt5_sip==12.17.1
+requests>=2.28.0
+numpy==1.26.4
+pillow==10.2.0
+paddlepaddle==2.6.2
+pywin32
