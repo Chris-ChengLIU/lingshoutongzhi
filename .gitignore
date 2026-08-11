@@ -43,6 +43,9 @@ data/groups.json
 data/templates.json
 !data/sample_groups.csv
 
+# OCR 推理模型（由 download_models.ps1 生成，build.bat 缺失时自动下载）
+/models/
+
 # OS
 .DS_Store
 Thumbs.db

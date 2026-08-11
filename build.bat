@@ -23,7 +23,7 @@ REM )
 echo.
 echo 清理旧的构建文件...
 if exist "build" rmdir /s /q "build"
-if exist "dist\零售通知工具" rmdir /s /q "dist\零售通知工具"
+if exist "dist\RetailNotifier" rmdir /s /q "dist\RetailNotifier"
 
 echo.
 echo 正在打包...
@@ -33,16 +33,25 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
+REM 打包清单（零售通知工具.spec）已内置 data\templates.json 与 models\ ，
+REM 此处不再手工拷贝 data\ —— 否则会把打包机的 groups.json/auth.json 等运行时状态带进包。
+
 echo.
-echo 复制数据文件...
-if not exist "dist\零售通知工具\data" mkdir "dist\零售通知工具\data"
-copy /Y "data\groups.json"    "dist\零售通知工具\data\" >nul
-copy /Y "data\templates.json" "dist\零售通知工具\data\" >nul
+echo 检查 OCR 模型...
+if not exist "models\ch_PP-OCRv4_det_infer\inference.pdmodel" (
+    echo 未找到 OCR 模型，开始下载（约 18MB，需联网）...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "download_models.ps1"
+    if errorlevel 1 (
+        echo 错误: OCR 模型下载失败
+        pause & exit /b 1
+    )
+)
+echo OCR 模型就绪。
 
 echo.
 echo ========================================
 echo 打包完成！
-echo 程序目录: dist\零售通知工具\
-echo 入口文件: dist\零售通知工具\零售通知工具.exe
+echo 程序目录: dist\RetailNotifier\
+echo 入口文件: dist\RetailNotifier\零售通知工具.exe
 echo ========================================
 pause

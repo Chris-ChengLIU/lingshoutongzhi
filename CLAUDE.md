@@ -29,7 +29,9 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --tr
 # Run the app
 python main.py
 
-# Package with PyInstaller (produces dist\零售通知工具\零售通知工具.exe)
+# Package with PyInstaller (produces dist\RetailNotifier\零售通知工具.exe)
+# 输出目录必须是 ASCII：Paddle 的 C++ 推理引擎在 Windows 上打不开中文路径下的模型文件
+# （见 ocr_helper 的 _local_model_dir / _ensure_ascii_copy）。
 build.bat
 # or: pyinstaller "零售通知工具.spec"
 ```
@@ -69,7 +71,7 @@ Sending always runs in a background `QThread` to keep the UI responsive; progres
 
 ## Data & Runtime Files
 
-- `data/` — JSON state (`groups.json`, `templates.json`, `persons.json`); the app creates them at runtime. `groups.json` and `templates.json` are gitignored — only `sample_groups.csv` / `sample_person.xlsx` / `templates.json` are committed. `build.bat` copies `data/` into the PyInstaller output.
+- `data/` — JSON state (`groups.json`, `templates.json`, `persons.json`, `auth.json`, `pending_tasks.json`); the app creates/seeds them at runtime. All gitignored. **`data/` is intentionally NOT bundled into the exe** (only `models/` is) — bundling it would ship the builder's runtime state (e.g. a modified `auth.json` kills the first-login forced password change).
 - `logs/` — `app.log` (app-level logging set up in `main.py`), `send.log` (sender logging set up in `sender.py`), `history.json` (send history). All gitignored.
 - `零售通知工具.spec` — PyInstaller spec with `collect_all` for Paddle/PyQt stack, whole-package dir copies of native `.pyd`/`.dll` packages, and excludes (`torch`, `tensorflow`, `paddle.distributed`, …) to slim the bundle. Touch this only if the dependency set changes.
 

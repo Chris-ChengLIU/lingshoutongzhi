@@ -3,6 +3,10 @@ OCR 辅助模块
 截取企业微信搜索结果区域，识别联系人部门信息并匹配目标单位。
 """
 
+import os
+import sys
+import shutil
+
 import pyautogui
 import time
 import logging
@@ -41,13 +45,100 @@ class WeComOCR:
         if self._ocr is None:
             from paddleocr import PaddleOCR
 
-            self._ocr = PaddleOCR(
-                lang="ch"
-            )
+            # 优先使用随程序打包的本地模型（离线可用），避免首次运行从外网下载模型失败。
+            kwargs = {"lang": "ch", "show_log": False}
+            model_dirs = self._local_model_dirs()
+            if all(d is not None for d in model_dirs):
+                det_dir, rec_dir, cls_dir = model_dirs
+                kwargs.update(
+                    det_model_dir=det_dir,
+                    rec_model_dir=rec_dir,
+                    cls_model_dir=cls_dir,
+                )
+                logger.info("使用本地 OCR 模型: %s", ", ".join(os.path.basename(d) for d in model_dirs))
+            else:
+                logger.warning("未找到内置 OCR 模型目录，将尝试在线下载（可能因网络受限失败）")
+
+            try:
+                self._ocr = PaddleOCR(**kwargs)
+            except SystemExit:
+                # paddleocr 下载模型失败时会直接 sys.exit(0)，在窗口程序里会静默闪退，这里转为可读错误
+                logger.error("PaddleOCR 模型初始化被中断（模型缺失或下载失败）")
+                raise RuntimeError(
+                    "OCR 模型初始化失败：未找到内置模型且在线下载失败。"
+                    "请确认程序自带的 models 目录完整，或重新打包（build.bat 会自动下载模型）。"
+                )
+            except Exception as e:
+                logger.error("PaddleOCR 初始化失败: %s", e)
+                raise RuntimeError("PaddleOCR 初始化失败，请检查程序自带的 models 目录") from e
 
             logger.info("PaddleOCR 初始化完成")
 
         return self._ocr
+
+    @staticmethod
+    def _model_base() -> str:
+        """模型根目录：frozen 时位于 sys._MEIPASS/models，开发环境位于项目根 models/。"""
+        if getattr(sys, "frozen", False):
+            return os.path.join(sys._MEIPASS, "models")
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
+        )
+
+    @classmethod
+    def _model_complete(cls, model_dir: str) -> bool:
+        return (
+            os.path.isfile(os.path.join(model_dir, "inference.pdmodel"))
+            and os.path.isfile(os.path.join(model_dir, "inference.pdiparams"))
+        )
+
+    @classmethod
+    def _local_model_dir(cls, name: str) -> Optional[str]:
+        """
+        返回可被 Paddle 加载的本地模型目录；未找到（文件不完整）返回 None。
+
+        注意：Paddle 的 C++ 推理引擎在 Windows 上无法打开含中文等非 ASCII 字符的路径，
+        因此当模型所在路径含非 ASCII 字符时，会先把模型复制到 %PROGRAMDATA% 下的
+        ASCII 目录（C:\\ProgramData\\LingShouOCR\\models）再返回该目录，保证离线可用。
+        """
+        path = os.path.join(cls._model_base(), name)
+        if not cls._model_complete(path):
+            return None
+        if any(ord(c) > 127 for c in path):
+            return cls._ensure_ascii_copy(name)
+        return path
+
+    @classmethod
+    def _ensure_ascii_copy(cls, name: str) -> Optional[str]:
+        """把模型复制到 ASCII 目录并返回其路径；复制失败返回 None。"""
+        src = os.path.join(cls._model_base(), name)
+        dst_root = os.path.join(
+            os.environ.get("PROGRAMDATA", "C:/ProgramData"), "LingShouOCR", "models"
+        )
+        try:
+            os.makedirs(dst_root, exist_ok=True)
+        except OSError as e:
+            logger.error("创建模型缓存目录失败 %s: %s", dst_root, e)
+            return None
+        dst = os.path.join(dst_root, name)
+        if cls._model_complete(dst):
+            return dst
+        try:
+            if os.path.isdir(dst):
+                shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst)
+            logger.info("已将 OCR 模型复制到 ASCII 目录: %s", dst)
+        except OSError as e:
+            logger.error("复制 OCR 模型到 ASCII 目录失败: %s", e)
+            return None
+        return dst if cls._model_complete(dst) else None
+
+    def _local_model_dirs(self):
+        return (
+            self._local_model_dir("ch_PP-OCRv4_det_infer"),
+            self._local_model_dir("ch_PP-OCRv4_rec_infer"),
+            self._local_model_dir("ch_ppocr_mobile_v2.0_cls_infer"),
+        )
 
     def capture_result_area(self) -> object:
         """根据企业微信窗口实际位置截取搜索结果区域"""
