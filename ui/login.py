@@ -82,6 +82,9 @@ class ChangeTokenDialog(QDialog):
         self.auth = auth
         self.role = role
         self.forced = forced
+        self.is_approver = (role == ROLE_APPROVER)   # 审批人改密必须登记工号与 SSO 账号
+        self.employee_no = ""
+        self.sso_account = ""
         self.setWindowTitle("首次登录，请修改 Token" if forced else "修改 Token")
         self.setMinimumWidth(420)
         self.init_ui()
@@ -109,6 +112,16 @@ class ChangeTokenDialog(QDialog):
         self.confirm_edit.setPlaceholderText("再次输入新 Token")
         form.addRow("确认 Token：", self.confirm_edit)
 
+        if self.is_approver:
+            # 审批人改密必须登记身份信息，便于审计追溯
+            self.employee_no_edit = QLineEdit()
+            self.employee_no_edit.setPlaceholderText("请输入工号")
+            form.addRow("工号：", self.employee_no_edit)
+
+            self.sso_account_edit = QLineEdit()
+            self.sso_account_edit.setPlaceholderText("请输入 SSO 账号名")
+            form.addRow("SSO 账号名：", self.sso_account_edit)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
@@ -123,8 +136,40 @@ class ChangeTokenDialog(QDialog):
         if new_token != confirm:
             QMessageBox.warning(self, "提示", "两次输入的 Token 不一致")
             return
-        if not self.auth.change_token(self.role, new_token):
+
+        employee_no, sso_account = "", ""
+        if self.is_approver:
+            # 审批人改密强制登记工号与 SSO 账号名
+            employee_no = self.employee_no_edit.text().strip()
+            sso_account = self.sso_account_edit.text().strip()
+            if not employee_no:
+                QMessageBox.warning(self, "提示", "审批人修改 Token 必须填写工号")
+                return
+            if not sso_account:
+                QMessageBox.warning(self, "提示", "审批人修改 Token 必须填写 SSO 账号名")
+                return
+
+        if not self.auth.change_token(
+            self.role, new_token,
+            employee_no=employee_no or None,
+            sso_account=sso_account or None,
+        ):
             QMessageBox.warning(self, "提示", "修改失败，请重试")
             return
+
+        self.employee_no = employee_no
+        self.sso_account = sso_account
+        if self.is_approver:
+            self._audit_change(employee_no, sso_account)
+
         QMessageBox.information(self, "成功", "Token 已更新，后续请使用新 Token 登录")
         self.accept()
+
+    def _audit_change(self, employee_no: str, sso_account: str):
+        """把审批人改密事件连同工号/SSO 账号写入审计日志（audit.jsonl + app.log）"""
+        from core.approval import AuditLog
+        AuditLog().log(
+            "change_token",
+            reviewer=ROLE_LABELS.get(self.role, self.role),
+            detail=f"工号={employee_no}, SSO账号={sso_account}",
+        )

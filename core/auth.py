@@ -116,6 +116,8 @@ class AuthManager:
                 "token_hash": _pbkdf2_hash(INITIAL_OPERATOR_TOKEN, salt_op),
                 "must_change": True,
                 "created_at": now,
+                "employee_no": "",   # 经办人改密时无需登记
+                "sso_account": "",
             },
             ROLE_APPROVER: {
                 "role": ROLE_APPROVER,
@@ -123,6 +125,8 @@ class AuthManager:
                 "token_hash": _pbkdf2_hash(INITIAL_APPROVER_TOKEN, salt_ap),
                 "must_change": True,
                 "created_at": now,
+                "employee_no": "",
+                "sso_account": "",
             },
         }
         self.save()
@@ -162,8 +166,16 @@ class AuthManager:
                 return record["role"], bool(record.get("must_change", False))
         return None, False
 
-    def change_token(self, role: str, new_token: str) -> bool:
-        """修改指定角色的 Token：重新生成盐、重算哈希，旧 Token 立即失效"""
+    def change_token(self, role: str, new_token: str,
+                     employee_no: str = None, sso_account: str = None) -> bool:
+        """
+        修改指定角色的 Token：重新生成盐、重算哈希，旧 Token 立即失效。
+
+        审批人改密时须登记工号与 SSO 账号名，随记录持久化并写入日志。
+        Args:
+            employee_no: 审批人工号（可选，传入则更新记录）
+            sso_account: 审批人 SSO 账号名（可选，传入则更新记录）
+        """
         record = self.records.get(role)
         if record is None:
             return False
@@ -174,8 +186,15 @@ class AuthManager:
         record["salt"] = new_salt.hex()
         record["token_hash"] = _pbkdf2_hash(new_token, new_salt)
         record["must_change"] = False
+        if employee_no is not None:
+            record["employee_no"] = employee_no.strip()
+        if sso_account is not None:
+            record["sso_account"] = sso_account.strip()
         self.save()
-        logger.info("Token 已更新: role=%s", role)
+        logger.info(
+            "Token 已更新: role=%s employee_no=%s sso_account=%s",
+            role, record.get("employee_no"), record.get("sso_account"),
+        )
         return True
 
     def reset(self):
