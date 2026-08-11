@@ -47,79 +47,168 @@ STATUS_LABELS = {
 
 
 class ApprovalSendWorker(QObject):
-    """在子线程中执行审批通过的发送任务（复用现有发送内核）"""
+    """在子线程中串行执行审批通过的发送任务（复用现有发送内核）。
+
+    改进：由【单个】常驻 QThread 驱动，任务经队列串行处理，
+    不再"每任务新建一个 QThread"。旧实现在上一条任务的完成回调里
+    同步创建新线程，会因旧线程尚未收尾而丢到新线程的 started→run 投递，
+    导致批次中第 2 条任务的 worker.run 不执行、状态卡在 sending。
+    """
 
     progress = pyqtSignal(int, int, str)                 # current, total, target_name
     result = pyqtSignal(object)                          # SendResult
+    task_started = pyqtSignal(int)                       # task_id
     task_finished = pyqtSignal(int, int, int, list)      # task_id, success, total, results
+    queue_finished = pyqtSignal(bool)                    # 整队列处理完毕，参数=是否被停止
 
-    def __init__(self, task: dict, store: PendingTaskStore):
+    def __init__(self, store: PendingTaskStore, reviewer: str = "审批人"):
         super().__init__()
-        self.task = task
         self.store = store
+        self.reviewer = reviewer
+        self.audit = AuditLog()
+        self._queue: list = []
+        self._processing = False
+        self._stop_flag = False
+        self._current_task = None
         self.sender = None
 
-    def run(self):
-        task_id = self.task["id"]
-        remaining = list(self.task.get("remaining_targets") or self.task.get("targets") or [])
+    # ── 主线程经 queued 信号调用的入口 ───────────────────
+    def submit(self, task_ids):
+        """追加一批任务并开始处理（线程空闲时立即消费队列）"""
+        self._stop_flag = False
+        self._queue.extend(task_ids)
+        self._maybe_start()
 
+    def stop(self):
+        """请求停止：结束当前发送，并丢弃后续队列"""
+        self._stop_flag = True
+        if self.sender is not None:
+            self.sender.stop()
+
+    # ── 队列处理（均在 worker 线程内执行）─────────────────
+    def _maybe_start(self):
+        if self._processing:
+            return
+        self._processing = True
         try:
-            if self.task.get("type") == "personal":
+            while self._queue:
+                if self._stop_flag:
+                    self._mark_remaining_failed()
+                    self._queue.clear()
+                    break
+                task_id = self._queue.pop(0)
+                self._run_one(task_id)
+            self.queue_finished.emit(self._stop_flag)
+        finally:
+            self._processing = False
+
+    def _mark_remaining_failed(self):
+        """停止时把尚未开始的任务标记为失败，避免残留 approved 状态"""
+        for tid in self._queue:
+            t = self.store.get(tid)
+            if t is not None and t.get("status") == STATUS_APPROVED:
+                self.store.update_status(tid, STATUS_FAILED, reviewer=self.reviewer,
+                                         detail={"result": "已停止"})
+
+    def _run_one(self, task_id: int):
+        task = self.store.get(task_id)
+        if task is None:
+            return
+        self._current_task = task
+
+        # 写前提交：先落盘 sending，再执行。
+        # 崩溃续发的任务（check_stale_tasks 传入，状态仍为 sending）保留已落盘的
+        # sent_targets/remaining_targets，只补发剩余；新任务才重置为全部目标。
+        was_sending = task.get("status") == STATUS_SENDING
+        self.store.update_status(task_id, STATUS_SENDING, reviewer=self.reviewer)
+        if not was_sending:
+            self.store.update_progress(task_id, [], list(task.get("targets") or []))
+        self.audit.log("execute_start", task_id=task_id, reviewer=self.reviewer,
+                       target_summary=self._summary(task))
+        self.task_started.emit(task_id)
+
+        remaining = list(task.get("remaining_targets") or task.get("targets") or [])
+        try:
+            if task.get("type") == "personal":
                 self.sender = PersonalSender(
-                    search_delay=self.task.get("send_params", {}).get("search_delay", 1.5),
-                    send_interval=self.task.get("send_params", {}).get("send_interval", 2.0),
+                    search_delay=task.get("send_params", {}).get("search_delay", 1.5),
+                    send_interval=task.get("send_params", {}).get("send_interval", 2.0),
                 )
                 results = self.sender.send_to_persons(
                     remaining,
-                    self.task.get("content", ""),
-                    self.task.get("file_paths") or [],
+                    task.get("content", ""),
+                    task.get("file_paths") or [],
                     progress_callback=lambda c, t, n: self.progress.emit(c, t, n),
                     result_callback=self._on_result,
                 )
             else:
                 self.sender = WebhookSender(
-                    interval=self.task.get("send_params", {}).get("interval", 3.0),
-                    retries=self.task.get("send_params", {}).get("retries", 2),
+                    interval=task.get("send_params", {}).get("interval", 3.0),
+                    retries=task.get("send_params", {}).get("retries", 2),
                 )
                 results = self.sender.send_to_groups(
                     remaining,
-                    self.task.get("content", ""),
+                    task.get("content", ""),
                     progress_callback=lambda c, t, n: self.progress.emit(c, t, n),
                     result_callback=self._on_result,
                 )
-
             success = sum(1 for r in results if r.success)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            results = [SendResult(self.task.get("content", ""), False, f"执行异常: {e}")]
+            results = [SendResult(task.get("content", ""), False, f"执行异常: {e}")]
             success = 0
 
-        self.task_finished.emit(task_id, success, len(results), list(results))
+        # 结果落盘 + 审计（群组任务复用现有 SendLog 写入历史）
+        total = len(results)
+        status = STATUS_DONE if success == total else STATUS_FAILED
+        self.store.update_status(task_id, status, detail={"result": f"{success}/{total}"})
+        if task.get("type") == "group":
+            send_log = SendLog()
+            for r in results:
+                send_log.add(r)
+            send_log.save_to_history(
+                task.get("content", ""),
+                {"total": total, "success": success, "failed": total - success},
+            )
+        action = "execute_done" if status == STATUS_DONE else "execute_fail"
+        self.audit.log(action, task_id=task_id, reviewer=self.reviewer,
+                       target_summary=self._summary(task), detail=f"{success}/{total}")
+
+        self.task_finished.emit(task_id, success, total, list(results))
 
     def _on_result(self, result: SendResult):
         """每条目标发送完成即落盘进度，供崩溃续发"""
         self.result.emit(result)
-        task = self.store.get(self.task["id"])
+        task = self._current_task
         if task is None:
             return
-        sent = list(task.get("sent_targets") or [])
-        remaining = list(task.get("remaining_targets") or task.get("targets") or [])
+        task_id = task["id"]
+        stored = self.store.get(task_id)
+        if stored is None:
+            return
+        sent = list(stored.get("sent_targets") or [])
+        remaining = list(stored.get("remaining_targets") or stored.get("targets") or [])
         for t in remaining:
             if t.get("name") == result.group_name:
                 remaining.remove(t)
                 if result.success:
                     sent.append(t)
                 break
-        self.store.update_progress(self.task["id"], sent, remaining)
+        self.store.update_progress(task_id, sent, remaining)
 
-    def stop(self):
-        if self.sender is not None:
-            self.sender.stop()
+    @staticmethod
+    def _summary(task: dict) -> str:
+        count = len(task.get("targets") or [])
+        unit = "群" if task.get("type") == "group" else "人"
+        return f"{count} {unit}"
 
 
 class ApprovalWorkbench(QMainWindow):
     """审批工作台"""
+
+    # 主线程 → worker 线程的任务投递信号（queued 连接，跨线程安全）
+    submit_signal = pyqtSignal(list)
 
     def __init__(self, store=None, auth=None, parent=None):
         super().__init__(parent)
@@ -128,7 +217,6 @@ class ApprovalWorkbench(QMainWindow):
         self.audit = AuditLog()
         self.worker = None
         self.thread = None
-        self._queue = []
         self.is_executing = False
         self.setWindowTitle("审批工作台")
         self.setMinimumSize(960, 640)
@@ -383,46 +471,30 @@ class ApprovalWorkbench(QMainWindow):
                            target_summary=self._summary(task))
         self.refresh()
 
-    # ── 批量执行 ──────────────────────────────────────────
+    # ── 批量执行（单线程串行处理整个队列）─────────────────
     def start_execution(self, task_ids):
-        self._queue = list(task_ids)
+        """把任务交给常驻 worker 的队列串行执行"""
+        if not task_ids:
+            return
         self.is_executing = True
         self._set_controls_enabled(False)
-        self._run_next()
+        self._ensure_worker()
+        self.submit_signal.emit(list(task_ids))
 
-    def _run_next(self):
-        if not self._queue:
-            self.is_executing = False
-            self._set_controls_enabled(True)
-            self.status_label.setText("执行完成")
-            self.progress_bar.setVisible(False)
-            self.refresh()
+    def _ensure_worker(self):
+        """惰性创建唯一的常驻 QThread + ApprovalSendWorker（只建一次）"""
+        if self.thread is not None:
             return
-        task_id = self._queue.pop(0)
-        task = self.store.get(task_id)
-        if task is None:
-            self._run_next()
-            return
-        reviewer = self._reviewer()
-        # 写前提交：先落盘 sending 与进度，再执行
-        self.store.update_status(task_id, STATUS_SENDING, reviewer=reviewer)
-        self.store.update_progress(task_id, [], list(task.get("targets") or []))
-        self.audit.log("execute_start", task_id=task_id, reviewer=reviewer,
-                       target_summary=self._summary(task))
-
-        self.progress_bar.setMaximum(len(task.get("targets") or []))
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.status_label.setText(f"正在发送任务 #{task_id}...")
-
         self.thread = QThread()
-        self.worker = ApprovalSendWorker(task, self.store)
+        self.worker = ApprovalSendWorker(self.store, reviewer=self._reviewer())
         self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        # 主线程 emit → worker 线程 queued 执行，避免跨线程直接调用
+        self.submit_signal.connect(self.worker.submit)
+        self.worker.task_started.connect(self._on_task_started)
         self.worker.progress.connect(self._on_progress)
         self.worker.result.connect(self._on_result)
         self.worker.task_finished.connect(self._on_task_finished)
-        self.worker.task_finished.connect(self.thread.quit)
+        self.worker.queue_finished.connect(self._on_queue_finished)
         self.thread.start()
 
     def _on_progress(self, current: int, total: int, name: str):
@@ -433,30 +505,39 @@ class ApprovalWorkbench(QMainWindow):
         # 需要时可在右侧扩展逐条结果展示，当前仅推进进度
         pass
 
-    def _on_task_finished(self, task_id: int, success: int, total: int, results: list):
+    def _on_task_started(self, task_id: int):
         task = self.store.get(task_id)
-        if task is not None:
-            status = STATUS_DONE if success == total else STATUS_FAILED
-            self.store.update_status(task_id, status, detail={"result": f"{success}/{total}"})
-            # 群组任务复用现有 SendLog 写入历史记录
-            if task.get("type") == "group":
-                send_log = SendLog()
-                for r in results:
-                    send_log.add(r)
-                send_log.save_to_history(
-                    task.get("content", ""),
-                    {"total": total, "success": success, "failed": total - success},
-                )
-            action = "execute_done" if status == STATUS_DONE else "execute_fail"
-            self.audit.log(action, task_id=task_id, reviewer=self._reviewer(),
-                           target_summary=self._summary(task), detail=f"{success}/{total}")
-        self._run_next()
+        total = len(task.get("targets") or []) if task else 0
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.status_label.setText(f"正在发送任务 #{task_id}...")
+
+    def _on_task_finished(self, task_id: int, success: int, total: int, results: list):
+        # 状态与审计已在 worker 内完成，这里仅做界面反馈并刷新列表
+        self.status_label.setText(f"任务 #{task_id} 处理完成: 成功 {success}/{total}")
+        self.refresh()
+
+    def _on_queue_finished(self, stopped: bool):
+        self.is_executing = False
+        self._set_controls_enabled(True)
+        self.status_label.setText("已停止" if stopped else "执行完成")
+        self.progress_bar.setVisible(False)
+        self.refresh()
 
     def stop_execution(self):
         if self.worker is not None:
             self.worker.stop()
         self.status_label.setText("正在停止...")
         self.stop_btn.setEnabled(False)
+
+    def closeEvent(self, event):
+        """关闭窗口时停止 worker 并等待线程退出，避免线程销毁告警"""
+        if self.worker is not None and self.thread is not None:
+            self.worker.stop()
+            self.thread.quit()
+            self.thread.wait(3000)
+        event.accept()
 
     def _set_controls_enabled(self, enabled: bool):
         self.approve_btn.setEnabled(enabled)
